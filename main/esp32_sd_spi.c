@@ -9,6 +9,9 @@
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
 
+#include "esp_timer.h"
+#include <rom/ets_sys.h> //For ets_delay_us()
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -24,11 +27,12 @@ static const char *TAG = "esp32_sd_spi";
 #define EXAMPLE_MAX_CHAR_SIZE 64
 #define QUEUE_LENGTH 256             // Number of bytes
 #define QUEUE_ITEM_SIZE sizeof(char) // Each item is one byte
-#define MEASURE_INTERVAL 1000        // Measure interval in milliseconds
-#define MS_BETWEEN_DATA_GENERATION 10
+#define MEASURE_INTERVAL 10000        // Measure interval in milliseconds
+#define DATA_GEN_DELAY_US 4 
 
 static QueueHandle_t data_queue;
 static FILE *file = NULL;
+static uint32_t total_bytes_written = 0;
 
 // Task to generate data and place it onto the queue
 static void data_generator_task(void *param)
@@ -44,14 +48,50 @@ static void data_generator_task(void *param)
         }
         else
         {
-            ESP_LOGI(TAG, "Data generated: %c", data);
+            //ESP_LOGI(TAG, "Data generated: %c", data);
         }
 
         // Generate next character
         data = (data == 'Z') ? 'A' : data + 1; // Cycle through 'A' to 'Z'
 
         // Delay for a bit to simulate data generation interval
-        vTaskDelay(pdMS_TO_TICKS(MS_BETWEEN_DATA_GENERATION)); // Adjust this to control the data generation rate
+        //vTaskDelay(pdMS_TO_TICKS(MS_BETWEEN_DATA_GENERATION)); // Adjust this to control the data generation rate
+
+        ets_delay_us(DATA_GEN_DELAY_US);//busy wait delay here in micro seconds instead of millisecond non-blocking delay   
+    }
+}
+
+// Task to write data from the queue to the SD card
+static void sd_card_writer_task(void *param)
+{
+    char data;
+    int64_t start_time_us = esp_timer_get_time();
+    
+    while (1) {
+        // Wait for data to arrive on the queue
+        if (xQueueReceive(data_queue, &data, portMAX_DELAY) == pdPASS) {
+            if (file != NULL) {
+                fputc(data, file);
+                fflush(file); // Ensure data is written to the SD card
+                total_bytes_written++;
+                
+                int64_t current_time_us = esp_timer_get_time();
+                int64_t elapsed_time_us = current_time_us - start_time_us;
+                
+                if (elapsed_time_us >= MEASURE_INTERVAL * 1000) {
+                    float write_speed_bps = (total_bytes_written * 8.0) / (elapsed_time_us / 1000000.0); // in bits per second
+                    //float write_speed_mbps = write_speed_bps / 1000000.0; // convert to Mbps
+                    
+                    ESP_LOGI(TAG, "Write Speed: %.5f bps", write_speed_bps);
+                    
+                    // Reset counters
+                    total_bytes_written = 0;
+                    start_time_us = esp_timer_get_time();
+                }
+            } else {
+                ESP_LOGE(TAG, "File not open");
+            }
+        }
     }
 }
 
@@ -127,11 +167,24 @@ void app_main(void)
         return;
     }
 
+    //Open file for writing data and keep it open 
+    const char *file_path = MOUNT_POINT"/data.txt";
+    ESP_LOGI(TAG, "Opening file %s", file_path);
+    file = fopen(file_path, "w");
+    if (file == NULL) {
+        ESP_LOGE(TAG, "Failed to open file for writing");
+        return;
+    }
+    if (file != NULL) {
+        setvbuf(file, NULL, _IOFBF, 4096); // Set a larger buffer size
+    }
+
+    xTaskCreatePinnedToCore(sd_card_writer_task, "sd_card_writer_task", 4096, NULL, 5, NULL, 0); // Run on core 0
     xTaskCreatePinnedToCore(data_generator_task, "data_generator_task", 4096, NULL, 5, NULL, 1); // Run on core 1
 
-    esp_vfs_fat_sdcard_unmount(mount_point, card);
-    ESP_LOGI(TAG, "Card unmounted");
+    //esp_vfs_fat_sdcard_unmount(mount_point, card);
+    //ESP_LOGI(TAG, "Card unmounted");
 
-    // deinitialize the bus after all devices are removed
-    spi_bus_free(host.slot);
+    //// deinitialize the bus after all devices are removed
+    //spi_bus_free(host.slot);
 }
