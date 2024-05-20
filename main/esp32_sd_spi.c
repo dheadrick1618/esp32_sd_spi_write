@@ -26,9 +26,9 @@ const char *file_path = MOUNT_POINT "/new_data.txt";
 
 static const char *TAG = "esp32_sd_spi";
 
-#define DATA_CHUNK_SIZE 4096 // Size of a 'chunk' of data (bytes) for each write operation
+#define DATA_CHUNK_SIZE 16384 // Size of a 'chunk' of data (bytes) for each write operation
 
-#define QUEUE_LENGTH 4
+#define QUEUE_LENGTH 2
 #define QUEUE_ITEM_SIZE sizeof(char)
 #define MEASURE_INTERVAL_MS 5000 // Measure interval in milliseconds
 #define DATA_GEN_DELAY_US 1
