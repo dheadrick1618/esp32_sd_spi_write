@@ -1,5 +1,5 @@
-/*Written by Devin Headrick
-
+/*
+Written by Devin Headrick
 */
 #include <stdio.h>
 #include <string.h>
@@ -22,26 +22,41 @@
 #define PIN_NUM_CS 13   // CMD
 
 #define MOUNT_POINT "/sdcard"
+const char *file_path = MOUNT_POINT "/new_data.txt";
+
 static const char *TAG = "esp32_sd_spi";
 
-#define EXAMPLE_MAX_CHAR_SIZE 64
-#define QUEUE_LENGTH 1024            // Max number of bytes allocated for the queue to hold
-#define QUEUE_ITEM_SIZE sizeof(char) // Each item is one byte
-#define MEASURE_INTERVAL 5000        // Measure interval in milliseconds
+#define DATA_CHUNK_SIZE 4096 // Size of a 'chunk' of data (bytes) for each write operation
+
+#define QUEUE_LENGTH 4
+#define QUEUE_ITEM_SIZE sizeof(char)
+#define MEASURE_INTERVAL_MS 5000 // Measure interval in milliseconds
 #define DATA_GEN_DELAY_US 1
 
 static QueueHandle_t data_queue;
 static FILE *file = NULL;
 static uint32_t total_bytes_written = 0;
 
+typedef struct
+{
+    char data[DATA_CHUNK_SIZE];
+} data_chunk_t;
+
 // Task to generate data as bytes and place them onto the queue
 static void data_generator_task(void *param)
 {
-    char data = 'A'; // Starting character
+    data_chunk_t chunk;
+
+    // Create a 'chunk' of data of a particular size
+    for (int i = 0; i < DATA_CHUNK_SIZE; i++)
+    {
+        chunk.data[i] = 'A' + (i % 26); // Cycle between ASCII capital letters
+    }
+
     while (1)
     {
-        // Place data onto the queue
-        if (xQueueSend(data_queue, &data, portMAX_DELAY) != pdPASS)
+        // Place data chunk onto the queue
+        if (xQueueSend(data_queue, &chunk, portMAX_DELAY) != pdPASS)
         {
             ESP_LOGE(TAG, "Failed to send data to queue");
         }
@@ -49,18 +64,37 @@ static void data_generator_task(void *param)
         {
             // ESP_LOGI(TAG, "Data generated: %c", data);
         }
-        // Generate next character
-        data = (data == 'Z') ? 'A' : data + 1; // Cycle through 'A' to 'Z'
         // Delay for a bit to simulate data generation interval
-        // ets_delay_us(DATA_GEN_DELAY_US);//busy wait delay here in micro seconds instead of millisecond non-blocking delay
+        //ets_delay_us(DATA_GEN_DELAY_US); // busy wait delay here in micro seconds instead of millisecond non-blocking delay
     }
 }
 
+static esp_err_t write_data_to_file(const char *path, char *data)
+{
+    // Open the file
+    FILE *file = fopen(path, "a");
+    if (file == NULL)
+    {
+        ESP_LOGE(TAG, "Failed to open file for appending");
+        return ESP_FAIL;
+    }
+    // Write the data
+    if (fprintf(file, data) < 0)
+    {
+        ESP_LOGE(TAG, "Failed to write data to the file");
+        return ESP_FAIL;
+    }
+    // TODO - try writing data using fwrite as we do not need formatting provided by fprintf with the raw byte data
+
+    fclose(file);
+
+    return ESP_OK;
+}
+
 // Task to write data from the queue to the SD card
-// TODO - Try writing data in larger chunks (with size as power of 2) to speed up writing process
 static void sd_card_writer_task(void *param)
 {
-    char data;
+    data_chunk_t chunk;
     int64_t start_time_us = esp_timer_get_time();
     int64_t current_time_us = esp_timer_get_time();
     int64_t elapsed_time_us = 0;
@@ -68,33 +102,29 @@ static void sd_card_writer_task(void *param)
     while (1)
     {
         // Wait for data to arrive on the queue
-        if (xQueueReceive(data_queue, &data, portMAX_DELAY) == pdPASS)
+        if (xQueueReceive(data_queue, &chunk, portMAX_DELAY) == pdPASS)
         {
-            if (file != NULL)
-            {
-                fputc(data, file);
-                fflush(file); // Ensure data is written to the SD card
-                total_bytes_written++;
-
-                current_time_us = esp_timer_get_time();
-                elapsed_time_us = current_time_us - start_time_us;
-
-                if (elapsed_time_us >= MEASURE_INTERVAL * 1000)
-                {
-                    float write_speed_Bps = (total_bytes_written) / (elapsed_time_us / 1000000.0); // in bits per second
-                    // float write_speed_mbps = write_speed_bps / 1000000.0; // convert to Mbps
-
-                    ESP_LOGI(TAG, "Write Speed: %.5f Bytes per second ", write_speed_Bps);
-
-                    // Reset counters
-                    total_bytes_written = 0;
-                    start_time_us = esp_timer_get_time();
-                }
+            if(write_data_to_file(file_path, &chunk.data) != ESP_OK){
+                ESP_LOGI(TAG, "Error writing data chunk to sd card");
             }
-            else
+
+            total_bytes_written += DATA_CHUNK_SIZE;
+
+            current_time_us = esp_timer_get_time();
+            elapsed_time_us = current_time_us - start_time_us;
+
+            if (elapsed_time_us >= MEASURE_INTERVAL_MS * 1000)
             {
-                ESP_LOGE(TAG, "File not open");
+                float write_speed_Bps = (total_bytes_written) / (elapsed_time_us / 1000000.0); // in bits per second
+                // float write_speed_mbps = write_speed_bps / 1000000.0; // convert to Mbps
+
+                ESP_LOGI(TAG, "Write Speed: %.5f Bytes per second ", write_speed_Bps);
+
+                // Reset counters
+                total_bytes_written = 0;
+                start_time_us = esp_timer_get_time();
             }
+            fclose(file);
         }
     }
 }
@@ -107,7 +137,7 @@ void app_main(void)
 
     esp_vfs_fat_mount_config_t mount_config = {
         .format_if_mount_failed = false,
-        .max_files = 5,
+        .max_files = 6,
         .allocation_unit_size = 16 * 1024};
 
     sdmmc_card_t *card;
@@ -164,7 +194,7 @@ void app_main(void)
     // TODO - Create file, write to data for specific duration of time
 
     // Create a FreeRTOS queue for byte data
-    data_queue = xQueueCreate(QUEUE_LENGTH, QUEUE_ITEM_SIZE);
+    data_queue = xQueueCreate(QUEUE_LENGTH, sizeof(data_chunk_t));
     if (data_queue == NULL)
     {
         ESP_LOGE(TAG, "Failed to create queue");
@@ -172,21 +202,24 @@ void app_main(void)
     }
 
     // Open file for writing data and keep it open
-    const char *file_path = MOUNT_POINT "/data.txt";
-    ESP_LOGI(TAG, "Opening file %s", file_path);
-    file = fopen(file_path, "w");
-    if (file == NULL)
-    {
-        ESP_LOGE(TAG, "Failed to open file for writing");
-        return;
-    }
-    if (file != NULL)
-    {
-        setvbuf(file, NULL, _IOFBF, 4096); // Set a larger buffer size
-    }
+    // const char *file_path = MOUNT_POINT "/new_data.txt";
+    // ESP_LOGI(TAG, "Opening file %s", file_path);
+    // file = fopen(file_path, "a");
+    // if (file == NULL)
+    // {
+    //     ESP_LOGE(TAG, "Failed to open file for writing");
+    //     return;
+    // }
 
-    xTaskCreatePinnedToCore(sd_card_writer_task, "sd_card_writer_task", 4096, NULL, 5, NULL, 0); // Run on core 0
-    xTaskCreatePinnedToCore(data_generator_task, "data_generator_task", 4096, NULL, 5, NULL, 1); // Run on core 1
+    // if (file != NULL)
+    // {
+    //     setvbuf(file, NULL, _IOFBF, 4096); // Set a larger buffer size
+    // }
+
+    //TODO - check if data file exists already - if yes then wipe it , otherwise ignore (write fxn opens for appending)
+
+    xTaskCreatePinnedToCore(sd_card_writer_task, "sd_card_writer_task", 65536, NULL, 5, NULL, 0); // Run on core 0
+    xTaskCreatePinnedToCore(data_generator_task, "data_generator_task", 65536, NULL, 5, NULL, 1); // Run on core 1
 
     // esp_vfs_fat_sdcard_unmount(mount_point, card);
     // ESP_LOGI(TAG, "Card unmounted");
