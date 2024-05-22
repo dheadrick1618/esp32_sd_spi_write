@@ -16,10 +16,12 @@ Written by Devin Headrick
 #include "freertos/task.h"
 #include "freertos/queue.h"
 
-#define PIN_NUM_MISO 2  // D0
-#define PIN_NUM_MOSI 15 // D3
-#define PIN_NUM_CLK 14  // SCK
-#define PIN_NUM_CS 13   // CMD
+#include "config.h"
+
+//#define PIN_NUM_MISO 2  // D0
+//#define PIN_NUM_MOSI 15 // D3
+//#define PIN_NUM_CLK 14  // SCK
+//#define PIN_NUM_CS 13   // CMD
 
 #define MOUNT_POINT "/sdcard"
 const char *file_path = MOUNT_POINT "/new_data.txt";
