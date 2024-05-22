@@ -34,7 +34,7 @@ static const char *TAG = "esp32_sd_spi";
 #define DATA_GEN_DELAY_US 1
 
 static QueueHandle_t data_queue;
-static FILE *file = NULL;
+//static FILE *file = NULL;
 static uint32_t total_bytes_written = 0;
 
 typedef struct
@@ -124,7 +124,6 @@ static void sd_card_writer_task(void *param)
                 total_bytes_written = 0;
                 start_time_us = esp_timer_get_time();
             }
-            fclose(file);
         }
     }
 }
