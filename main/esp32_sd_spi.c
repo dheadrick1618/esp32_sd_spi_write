@@ -1,5 +1,7 @@
 /*
 Written by Devin Headrick
+
+To change the pinout for a different board, un-comment the desired define in config.h
 */
 #include <stdio.h>
 #include <string.h>
@@ -18,11 +20,6 @@ Written by Devin Headrick
 
 #include "config.h"
 
-//#define PIN_NUM_MISO 2  // D0
-//#define PIN_NUM_MOSI 15 // D3
-//#define PIN_NUM_CLK 14  // SCK
-//#define PIN_NUM_CS 13   // CMD
-
 #define MOUNT_POINT "/sdcard"
 const char *file_path = MOUNT_POINT "/new_data.txt";
 
@@ -34,6 +31,9 @@ static const char *TAG = "esp32_sd_spi";
 #define QUEUE_ITEM_SIZE sizeof(data_chunk_t)
 #define MEASURE_INTERVAL_MS 5000 // Measure interval in milliseconds
 #define DATA_GEN_DELAY_US 1
+
+#define FILE_COUNT_MAX 10
+#define NUM_WRITES_PER_FILE_MAX 1000
 
 static QueueHandle_t data_queue;
 static uint32_t total_bytes_written = 0;
@@ -83,7 +83,6 @@ static int write_data_to_file(const char *path, char *data)
     setvbuf(file, NULL, _IOFBF, 32 * 1024);
 
     // Write the data
-    //written_bytes = fprintf(file, data);
     written_bytes = fwrite(data, sizeof(char), DATA_CHUNK_SIZE, file);
     if (written_bytes < 0)
     {
@@ -103,26 +102,45 @@ static void sd_card_writer_task()
     int64_t start_time_us = esp_timer_get_time();
     int64_t elapsed_time_us = 0;
 
+    int file_count = 1;
+    int num_writes_per_file = 0;
+
+    const char str[80] = "/sdcard/file_0.txt";
+
     while (1)
     {
         // Wait for data to arrive on the queue
         if (xQueueReceive(data_queue, &chunk, portMAX_DELAY) == pdPASS)
         {
-            // if(write_data_to_file(file_path, &chunk.data) != ESP_OK){
-            //     ESP_LOGI(TAG, "Error writing data chunk to sd card");
-            // }
-            // total_bytes_written += DATA_CHUNK_SIZE;
-            total_bytes_written += (uint32_t) write_data_to_file(file_path, &chunk.data);
+            // total_bytes_written += (uint32_t)write_data_to_file(file_path, &chunk.data);
+
+            if (file_count < FILE_COUNT_MAX)
+            {
+                if (num_writes_per_file < NUM_WRITES_PER_FILE_MAX)
+                {
+                    total_bytes_written += (uint32_t)write_data_to_file(str, &chunk.data);
+                    num_writes_per_file += 1;
+                }
+                else
+                {
+                    // Incremement the file name by 1
+                    sprintf(str, "/sdcard/file_%d.txt", file_count);
+                    file_count++;
+                    num_writes_per_file = 0;
+                }
+            }
+            else
+            {
+                ESP_LOGI(TAG, "Max num files written\n");
+                vTaskDelay(100000/portTICK_PERIOD_MS);
+            }
         }
         elapsed_time_us = esp_timer_get_time() - start_time_us;
 
         if (elapsed_time_us >= MEASURE_INTERVAL_MS * 1000)
         {
             float write_speed_Bps = (total_bytes_written) / (elapsed_time_us / 1000000.0); // in bits per second
-            // float write_speed_mbps = write_speed_bps / 1000000.0; // convert to Mbps
-
             ESP_LOGI(TAG, "Write Speed: %.5f Bytes per second ", write_speed_Bps);
-
             // Reset counters
             total_bytes_written = 0;
             start_time_us = esp_timer_get_time();
@@ -138,7 +156,7 @@ void app_main(void)
 
     esp_vfs_fat_mount_config_t mount_config = {
         .format_if_mount_failed = false,
-        .max_files = 6,
+        .max_files = FILE_COUNT_MAX,
         .allocation_unit_size = 64 * 1024};
 
     sdmmc_card_t *card;
@@ -192,9 +210,7 @@ void app_main(void)
 
     // Now use POSIX and C standard library functions to work with files thanks to VFS FAT FS mounting.
 
-    // TODO - Create file, write to data for specific duration of time
-
-    // Create a FreeRTOS queue for byte data
+    // Create a FreeRTOS queue for byte data to be shared between tasks on different cores
     data_queue = xQueueCreate(QUEUE_LENGTH, QUEUE_ITEM_SIZE);
     if (data_queue == NULL)
     {
@@ -202,14 +218,9 @@ void app_main(void)
         return;
     }
 
-    // TODO - check if data file exists already - if yes then wipe it , otherwise ignore (write fxn opens for appending)
-
     xTaskCreatePinnedToCore(sd_card_writer_task, "sd_card_writer_task", 77777, NULL, 7, NULL, 1); // Run on core 0
     xTaskCreatePinnedToCore(data_generator_task, "data_generator_task", 77777, NULL, 5, NULL, 0); // Run on core 1
 
-    // esp_vfs_fat_sdcard_unmount(mount_point, card);
-    // ESP_LOGI(TAG, "Card unmounted");
-
-    //// deinitialize the bus after all devices are removed
-    // spi_bus_free(host.slot);
+    //Dont need to worry about freeing memory or unmounting cards as this program is 
+    // expected to run from power on until power off 
 }
