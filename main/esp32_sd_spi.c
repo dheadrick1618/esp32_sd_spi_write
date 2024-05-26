@@ -75,7 +75,7 @@ static void data_generator_task(void *param)
 static int write_data_to_file(const char *path, char *data)
 {
     int written_bytes = 0;
-    FILE *file = fopen(path, "w");
+    FILE *file = fopen(path, "a");
     if (file == NULL)
     {
         ESP_LOGE(TAG, "Failed to open file for appending");
@@ -158,7 +158,7 @@ static void sd_card_writer_task()
                 sprintf(file_path, "%s/FILE_%d.txt", new_dir_name, file_count);
                 file_count++;
                 num_writes_per_file = 0;
-                ESP_LOGI(TAG, "FILE_%d has been written max times. Now writing to FILE_%d", file_count - 1, file_count);
+                //ESP_LOGI(TAG, "FILE_%d has been written max times. Now writing to FILE_%d", file_count - 1, file_count);
             }
         }
         //-------------------------------------------------------------------
