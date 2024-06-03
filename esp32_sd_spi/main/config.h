@@ -14,10 +14,10 @@
     #define PIN_SD_CS 13   // CMD
 
     // Using VSPI line for data source (FPGA) interfacing 
-    #define PIN_FPGA_MOSI 1
-    #define PIN_FPGA_MISO 2
-    #define PIN_FPGA_CLK  3
-    #define PIN_FPGA_CS   4
+    #define PIN_FPGA_MOSI 23
+    #define PIN_FPGA_MISO 19
+    #define PIN_FPGA_CLK  18
+    #define PIN_FPGA_CS   5
 
 #elif NODEMCU
     #define PIN_NUM_MISO 19  // D0
