@@ -1,10 +1,16 @@
 /*
 Written by Devin Headrick
 
-This program writes to a new directory every powercycle.
+This program writes to a new directory every powercycle by increasing the appended number 
+in the directory name. A file will be created and appended to for a mininum hardcoded number 
+of times, then a new file is created and appended etc. 
+
+We can use POSIX and C standard library functions to work with files thanks to VFS FAT FS mounting.
 
 Note:
 -To change the pinout for a different board, un-comment the desired define in config.h
+-SD cards typically have a 'sector size' of 512 bytes. This is the smallest unit of data that can be written to the card.
+-DMA is used by the SPI reader to read 4092 bytes into a buffer from the fpga data source at a time.
 
 TODO - For each new file to write, check if there is space on the SD card for the new file (with margin)
 */
@@ -23,16 +29,11 @@ TODO - For each new file to write, check if there is space on the SD card for th
 #include "freertos/queue.h"
 #include <math.h>
 #include <dirent.h>
-#include "config.h"
-
 #include "driver/spi_slave.h"
+#include "config.h" //For different boards with different pinouts
 
-// host definitions
-// #define SPI_SLAVE_HOST HSPI_HOST
 #define FPGA_SPI_HOST VSPI_HOST
-
 #define MOUNT_POINT "/sdcard"
-//#define DATA_CHUNK_SIZE 4096 // smaller For testing
 #define DATA_CHUNK_SIZE 32768 // Size of a 'chunk' of data (bytes) for each write operation
 #define QUEUE_LENGTH 1
 #define QUEUE_ITEM_SIZE sizeof(data_chunk_t)
@@ -87,8 +88,8 @@ static void read_spi_task(void *param)
 
     esp_err_t ret;
 
-    int recv_buf_size = 4092; // Double buffer size for overflow prevention margin
-    int num_fpga_packets_per_chunk = DATA_CHUNK_SIZE / recv_buf_size; // 24 bit (3 byte) fpga packets
+    int recv_buf_size = 4092; 
+    int num_fpga_packets_per_chunk = DATA_CHUNK_SIZE / recv_buf_size; 
 
     // int recv_buf_size = num_fpga_packets_per_chunk*2; // Double buffer size for overflow prevention margin
     WORD_ALIGNED_ATTR char recvbuf[4092] = "";
@@ -100,15 +101,12 @@ static void read_spi_task(void *param)
     while (1)
     {
         int packet_received_count = 0;
-
         // Receive SPI packets until we have enough for a data_chunk_t
         while (packet_received_count < num_fpga_packets_per_chunk)
         {
-            // Clear receive buffer
-            memset(recvbuf, 0x00, recv_buf_size);
+            memset(recvbuf, 0x00, recv_buf_size); //Clear receive buffer before each transaction
 
-            // Set up a transaction of 24 bytes to receive
-            t.length = (recv_buf_size) * 8;
+            t.length = (recv_buf_size) * 8; //length of a single transaction in bits
             t.tx_buffer = NULL;
             t.rx_buffer = recvbuf;
             /* This call enables the SPI slave interface to send/receive to the sendbuf and recvbuf. The transaction is
@@ -128,10 +126,9 @@ static void read_spi_task(void *param)
             // received data from the master.
 
             chunk.data[packet_received_count] = recvbuf;
-
             packet_received_count++;
         }
-        //printf("Data chunk built: \n");
+        //printf("Data chunk built! \n");
 
         // Place data chunk onto the queue
         if (xQueueSend(data_queue, &chunk, portMAX_DELAY) != pdPASS)
@@ -259,6 +256,8 @@ void app_main(void)
 
     esp_err_t ret;
 
+    // --------------------------------- SD CARD SPI CONFIG ---------------------------------
+
     esp_vfs_fat_mount_config_t mount_config = {
         .format_if_mount_failed = false,
         .max_files = 4,
@@ -281,8 +280,8 @@ void app_main(void)
     ret = spi_bus_initialize(host.slot, &sd_spi_bus_cfg, SDSPI_DEFAULT_DMA);
     if (ret != ESP_OK)
     {
-        ESP_LOGE(TAG, "Failed to init the spi bus\n");
-        return;
+        ESP_LOGE(TAG, "Failed to init the spi bus. Restarting ESP32 to re-attempt sd card spi bus init.");
+        esp_restart();
     }
 
     // This initializes the slot without card detect (CD) and write protect (WP) signals.
@@ -297,21 +296,24 @@ void app_main(void)
     {
         if (ret == ESP_FAIL)
         {
-            ESP_LOGE(TAG, "Failed to mount filesystem. ");
+            ESP_LOGE(TAG, "Failed to mount filesystem. Restarting ESP32 to attempt remount.");
+            //Restart to attempt remount 
+            esp_restart();
         }
         else
         {
             ESP_LOGE(TAG, "Failed to initialize the card (%s). "
-                          "Make sure SD card lines have pull-up resistors in place.",
+                          "Make sure SD card lines have pull-up resistors in place. Restarting ESP32 to attempt remount.",
                      esp_err_to_name(ret));
+            esp_restart();
         }
         return;
     }
 
     ESP_LOGI(TAG, "Filesystem mounted");
-    // Now use POSIX and C standard library functions to work with files thanks to VFS FAT FS mounting.
+    
 
-    // Card has been initialized, print its properties
+    // At this point the card has been initialized, so print its properties
     sdmmc_card_print_info(stdout, card);
 
     int prev_dir_num = get_previous_written_dir_num();
@@ -322,7 +324,9 @@ void app_main(void)
     snprintf(new_dir_name, sizeof(new_dir_name), "%s/DIR%d", MOUNT_POINT, current_dir_num);
     if (mkdir(new_dir_name, 0775) != 0)
     {
-        ESP_LOGE(TAG, "Failed to create directory %s", new_dir_name);
+        ESP_LOGE(TAG, "Failed to create directory %s. Restarting ESP32 to re-attempt dir creation.", new_dir_name);
+        esp_restart();
+
     }
     else
     {
@@ -332,12 +336,12 @@ void app_main(void)
     sprintf(file_path, "%s/FILE_0.txt", new_dir_name);
     ESP_LOGI(TAG, "Writing to this path now: %s \n", file_path);
 
-    // Create a FreeRTOS queue for byte data to be shared between tasks on different cores
+    // Create a FreeRTOS queue for data chunks to be shared between tasks on different cores
     data_queue = xQueueCreate(QUEUE_LENGTH, QUEUE_ITEM_SIZE);
     if (data_queue == NULL)
     {
-        ESP_LOGE(TAG, "Failed to create queue");
-        return;
+        ESP_LOGE(TAG, "Failed to create queue. Restarting ESP32 to re-attempt queue creation.");
+        esp_restart();
     }
     //----------------------- FPGA SPI CONFIG --------------------------
 
@@ -361,14 +365,15 @@ void app_main(void)
 
     // Initialize SPI slave interface
     ret = spi_slave_initialize(FPGA_SPI_HOST, &fpga_spi_buscfg, &slvcfg, SPI_DMA_CH_AUTO);
-    //ret = spi_slave_initialize(FPGA_SPI_HOST, &fpga_spi_buscfg, &slvcfg, 0);
-    assert(ret == ESP_OK);
-
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG,"Failed to initialize spi slave for FPGA data input. Restarting ESP32 to re-attempt spi slave init.");
+        esp_restart();
+    }
     //---------------------------------------------------
 
-    xTaskCreatePinnedToCore(sd_card_writer_task, "sd_card_writer_task", 77777, NULL, 7, NULL, 1); // Run on core 0
-    // xTaskCreatePinnedToCore(data_generator_task, "data_generator_task", 77777, NULL, 5, NULL, 0); // Run on core 1
-    xTaskCreatePinnedToCore(read_spi_task, "read_spi_task", 77777, NULL, 5, NULL, 0); // Run on core 1
+    xTaskCreatePinnedToCore(sd_card_writer_task, "sd_card_writer_task", 77777, NULL, 7, NULL, 1); // Run on core 1
+    // xTaskCreatePinnedToCore(data_generator_task, "data_generator_task", 77777, NULL, 5, NULL, 0); // Run on core 0
+    xTaskCreatePinnedToCore(read_spi_task, "read_spi_task", 77777, NULL, 5, NULL, 0); // Run on core 0 
 
     // Dont need to worry about freeing memory or unmounting cards as this program is
     // expected to run from power on until power off.
