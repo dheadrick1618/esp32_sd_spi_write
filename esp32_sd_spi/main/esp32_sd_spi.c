@@ -28,10 +28,11 @@ TODO - For each new file to write, check if there is space on the SD card for th
 #include "driver/spi_slave.h"
 
 // host definitions
-#define SPI_SLAVE_HOST HSPI_HOST
-#define SD_SPI_HOST VSPI_HOST
+// #define SPI_SLAVE_HOST HSPI_HOST
+#define FPGA_SPI_HOST VSPI_HOST
 
 #define MOUNT_POINT "/sdcard"
+//#define DATA_CHUNK_SIZE 4096 // smaller For testing
 #define DATA_CHUNK_SIZE 32768 // Size of a 'chunk' of data (bytes) for each write operation
 #define QUEUE_LENGTH 1
 #define QUEUE_ITEM_SIZE sizeof(data_chunk_t)
@@ -73,25 +74,25 @@ static void data_generator_task(void *param)
         else
         {
             // ESP_LOGI(TAG, "Data generated: %c", data);
+            taskYIELD();
         }
         // ets_delay_us(DATA_GEN_DELAY_US); // busy wait delay here in micro seconds instead of millisecond non-blocking delay to simulate data input read
     }
 }
 
-
-
 static void read_spi_task(void *param)
 {
-    data_chunk_t chunk; //The struct being placed onto queue for sd writer task 
+    data_chunk_t chunk;                     // The struct being placed onto queue for sd writer task
+    memset(chunk.data, 0, DATA_CHUNK_SIZE); // Clear the data chunk for the first iteration
 
     esp_err_t ret;
 
-    int num_fpga_packets_per_chunk = DATA_CHUNK_SIZE / 3; //24 bit (3 byte) fpga packets
-     
-    int recv_buf_size = 129; // Double buffer size for overflow prevention margin
-    //int recv_buf_size = num_fpga_packets_per_chunk*2; // Double buffer size for overflow prevention margin
-    WORD_ALIGNED_ATTR char recvbuf[129] = "";
-    memset(recvbuf, 0, 128);
+    int recv_buf_size = 4092; // Double buffer size for overflow prevention margin
+    int num_fpga_packets_per_chunk = DATA_CHUNK_SIZE / recv_buf_size; // 24 bit (3 byte) fpga packets
+
+    // int recv_buf_size = num_fpga_packets_per_chunk*2; // Double buffer size for overflow prevention margin
+    WORD_ALIGNED_ATTR char recvbuf[4092] = "";
+    memset(recvbuf, 0, recv_buf_size);
     spi_slave_transaction_t t;
     memset(&t, 0, sizeof(t));
 
@@ -104,10 +105,11 @@ static void read_spi_task(void *param)
         while (packet_received_count < num_fpga_packets_per_chunk)
         {
             // Clear receive buffer
-            memset(recvbuf, 0xA5, 129);
+            memset(recvbuf, 0x00, recv_buf_size);
 
-            // Set up a transaction of 128 bytes to send/receive
-            t.length = (recv_buf_size-1) * 8;
+            // Set up a transaction of 24 bytes to receive
+            t.length = (recv_buf_size) * 8;
+            t.tx_buffer = NULL;
             t.rx_buffer = recvbuf;
             /* This call enables the SPI slave interface to send/receive to the sendbuf and recvbuf. The transaction is
             initialized by the SPI master, however, so it will not actually happen until the master starts a hardware transaction
@@ -115,20 +117,32 @@ static void read_spi_task(void *param)
             .post_setup_cb callback that is called as soon as a transaction is ready, to let the master know it is free to transfer
             data.
             */
-            ret = spi_slave_transmit(SPI_SLAVE_HOST, &t, portMAX_DELAY);
+            ret = spi_slave_transmit(FPGA_SPI_HOST, &t, portMAX_DELAY);
 
-            if (ret != ESP_OK){
+            if (ret != ESP_OK)
+            {
                 ESP_LOGI(TAG, "Spi slave recv error ");
                 break;
             }
             // spi_slave_transmit does not return until the master has done a transmission, so by here we have sent our data and
-            // received data from the master. 
+            // received data from the master.
 
             chunk.data[packet_received_count] = recvbuf;
 
             packet_received_count++;
         }
-        printf("Data chunk built: \n");
+        //printf("Data chunk built: \n");
+
+        // Place data chunk onto the queue
+        if (xQueueSend(data_queue, &chunk, portMAX_DELAY) != pdPASS)
+        {
+            ESP_LOGE(TAG, "Failed to send data to queue");
+        }
+        else
+        {
+            // ESP_LOGI(TAG, "Data chunk written to task: ");
+        }
+        memset(chunk.data, 0, DATA_CHUNK_SIZE); // Clear the data chunk for the next iteration
     }
 }
 
@@ -209,8 +223,13 @@ static void sd_card_writer_task()
         {
             if (num_writes_per_file < NUM_WRITES_PER_FILE_MAX)
             {
-                total_bytes_written += (uint32_t)write_data_to_file(file_path, &chunk.data);
-                num_writes_per_file += 1;
+                int bytes_written_this_write = (uint32_t)write_data_to_file(file_path, &chunk.data);
+
+                if (bytes_written_this_write > 0)
+                {
+                    total_bytes_written += bytes_written_this_write;
+                    num_writes_per_file += 1;
+                }
             }
             else
             {
@@ -341,13 +360,15 @@ void app_main(void)
     };
 
     // Initialize SPI slave interface
-    ret = spi_slave_initialize(SPI_SLAVE_HOST, &fpga_spi_buscfg, &slvcfg, SPI_DMA_CH_AUTO);
+    ret = spi_slave_initialize(FPGA_SPI_HOST, &fpga_spi_buscfg, &slvcfg, SPI_DMA_CH_AUTO);
+    //ret = spi_slave_initialize(FPGA_SPI_HOST, &fpga_spi_buscfg, &slvcfg, 0);
     assert(ret == ESP_OK);
 
     //---------------------------------------------------
 
     xTaskCreatePinnedToCore(sd_card_writer_task, "sd_card_writer_task", 77777, NULL, 7, NULL, 1); // Run on core 0
-    xTaskCreatePinnedToCore(data_generator_task, "data_generator_task", 77777, NULL, 5, NULL, 0); // Run on core 1
+    // xTaskCreatePinnedToCore(data_generator_task, "data_generator_task", 77777, NULL, 5, NULL, 0); // Run on core 1
+    xTaskCreatePinnedToCore(read_spi_task, "read_spi_task", 77777, NULL, 5, NULL, 0); // Run on core 1
 
     // Dont need to worry about freeing memory or unmounting cards as this program is
     // expected to run from power on until power off.
