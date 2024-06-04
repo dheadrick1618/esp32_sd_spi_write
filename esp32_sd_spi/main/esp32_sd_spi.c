@@ -1,10 +1,16 @@
 /*
 Written by Devin Headrick
 
-This program writes to a new directory every powercycle.
+This program writes to a new directory every powercycle by increasing the appended number 
+in the directory name. A file will be created and appended to for a mininum hardcoded number 
+of times, then a new file is created and appended etc. 
+
+We can use POSIX and C standard library functions to work with files thanks to VFS FAT FS mounting.
 
 Note:
 -To change the pinout for a different board, un-comment the desired define in config.h
+-SD cards typically have a 'sector size' of 512 bytes. This is the smallest unit of data that can be written to the card.
+-DMA is used by the SPI reader to read 4092 bytes into a buffer from the fpga data source at a time.
 
 TODO - For each new file to write, check if there is space on the SD card for the new file (with margin)
 */
@@ -23,8 +29,10 @@ TODO - For each new file to write, check if there is space on the SD card for th
 #include "freertos/queue.h"
 #include <math.h>
 #include <dirent.h>
-#include "config.h"
+#include "driver/spi_slave.h"
+#include "config.h" //For different boards with different pinouts
 
+#define FPGA_SPI_HOST VSPI_HOST
 #define MOUNT_POINT "/sdcard"
 #define DATA_CHUNK_SIZE 32768 // Size of a 'chunk' of data (bytes) for each write operation
 #define QUEUE_LENGTH 1
@@ -67,8 +75,71 @@ static void data_generator_task(void *param)
         else
         {
             // ESP_LOGI(TAG, "Data generated: %c", data);
+            taskYIELD();
         }
         // ets_delay_us(DATA_GEN_DELAY_US); // busy wait delay here in micro seconds instead of millisecond non-blocking delay to simulate data input read
+    }
+}
+
+static void read_spi_task(void *param)
+{
+    data_chunk_t chunk;                     // The struct being placed onto queue for sd writer task
+    memset(chunk.data, 0, DATA_CHUNK_SIZE); // Clear the data chunk for the first iteration
+
+    esp_err_t ret;
+
+    int recv_buf_size = 4092; 
+    int num_fpga_packets_per_chunk = DATA_CHUNK_SIZE / recv_buf_size; 
+
+    // int recv_buf_size = num_fpga_packets_per_chunk*2; // Double buffer size for overflow prevention margin
+    WORD_ALIGNED_ATTR char recvbuf[4092] = "";
+    memset(recvbuf, 0, recv_buf_size);
+    spi_slave_transaction_t t;
+    memset(&t, 0, sizeof(t));
+
+    // Read 24 bit packets and fill a buffer until you have size 'Data chunk' then write that to queue
+    while (1)
+    {
+        int packet_received_count = 0;
+        // Receive SPI packets until we have enough for a data_chunk_t
+        while (packet_received_count < num_fpga_packets_per_chunk)
+        {
+            memset(recvbuf, 0x00, recv_buf_size); //Clear receive buffer before each transaction
+
+            t.length = (recv_buf_size) * 8; //length of a single transaction in bits
+            t.tx_buffer = NULL;
+            t.rx_buffer = recvbuf;
+            /* This call enables the SPI slave interface to send/receive to the sendbuf and recvbuf. The transaction is
+            initialized by the SPI master, however, so it will not actually happen until the master starts a hardware transaction
+            by pulling CS low and pulsing the clock etc. In this specific example, we use the handshake line, pulled up by the
+            .post_setup_cb callback that is called as soon as a transaction is ready, to let the master know it is free to transfer
+            data.
+            */
+            ret = spi_slave_transmit(FPGA_SPI_HOST, &t, portMAX_DELAY);
+
+            if (ret != ESP_OK)
+            {
+                ESP_LOGI(TAG, "Spi slave recv error ");
+                break;
+            }
+            // spi_slave_transmit does not return until the master has done a transmission, so by here we have sent our data and
+            // received data from the master.
+
+            chunk.data[packet_received_count] = recvbuf;
+            packet_received_count++;
+        }
+        //printf("Data chunk built! \n");
+
+        // Place data chunk onto the queue
+        if (xQueueSend(data_queue, &chunk, portMAX_DELAY) != pdPASS)
+        {
+            ESP_LOGE(TAG, "Failed to send data to queue");
+        }
+        else
+        {
+            // ESP_LOGI(TAG, "Data chunk written to task: ");
+        }
+        memset(chunk.data, 0, DATA_CHUNK_SIZE); // Clear the data chunk for the next iteration
     }
 }
 
@@ -149,8 +220,13 @@ static void sd_card_writer_task()
         {
             if (num_writes_per_file < NUM_WRITES_PER_FILE_MAX)
             {
-                total_bytes_written += (uint32_t)write_data_to_file(file_path, &chunk.data);
-                num_writes_per_file += 1;
+                int bytes_written_this_write = (uint32_t)write_data_to_file(file_path, &chunk.data);
+
+                if (bytes_written_this_write > 0)
+                {
+                    total_bytes_written += bytes_written_this_write;
+                    num_writes_per_file += 1;
+                }
             }
             else
             {
@@ -158,7 +234,7 @@ static void sd_card_writer_task()
                 sprintf(file_path, "%s/FILE_%d.txt", new_dir_name, file_count);
                 file_count++;
                 num_writes_per_file = 0;
-                //ESP_LOGI(TAG, "FILE_%d has been written max times. Now writing to FILE_%d", file_count - 1, file_count);
+                // ESP_LOGI(TAG, "FILE_%d has been written max times. Now writing to FILE_%d", file_count - 1, file_count);
             }
         }
         //-------------------------------------------------------------------
@@ -180,6 +256,8 @@ void app_main(void)
 
     esp_err_t ret;
 
+    // --------------------------------- SD CARD SPI CONFIG ---------------------------------
+
     esp_vfs_fat_mount_config_t mount_config = {
         .format_if_mount_failed = false,
         .max_files = 4,
@@ -190,25 +268,25 @@ void app_main(void)
 
     sdmmc_host_t host = SDSPI_HOST_DEFAULT(); // default freq at 20MHz
 
-    spi_bus_config_t bus_cfg = {
-        .mosi_io_num = PIN_NUM_MOSI,
-        .miso_io_num = PIN_NUM_MISO,
-        .sclk_io_num = PIN_NUM_CLK,
+    spi_bus_config_t sd_spi_bus_cfg = {
+        .mosi_io_num = PIN_SD_MOSI,
+        .miso_io_num = PIN_SD_MISO,
+        .sclk_io_num = PIN_SD_CLK,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
         .max_transfer_sz = 4092,
     };
 
-    ret = spi_bus_initialize(host.slot, &bus_cfg, SDSPI_DEFAULT_DMA);
+    ret = spi_bus_initialize(host.slot, &sd_spi_bus_cfg, SDSPI_DEFAULT_DMA);
     if (ret != ESP_OK)
     {
-        ESP_LOGE(TAG, "Failed to init the spi bus\n");
-        return;
+        ESP_LOGE(TAG, "Failed to init the spi bus. Restarting ESP32 to re-attempt sd card spi bus init.");
+        esp_restart();
     }
 
     // This initializes the slot without card detect (CD) and write protect (WP) signals.
     sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
-    slot_config.gpio_cs = PIN_NUM_CS;
+    slot_config.gpio_cs = PIN_SD_CS;
     slot_config.host_id = host.slot;
 
     ESP_LOGI(TAG, "Mounting filesystem");
@@ -218,21 +296,24 @@ void app_main(void)
     {
         if (ret == ESP_FAIL)
         {
-            ESP_LOGE(TAG, "Failed to mount filesystem. ");
+            ESP_LOGE(TAG, "Failed to mount filesystem. Restarting ESP32 to attempt remount.");
+            //Restart to attempt remount 
+            esp_restart();
         }
         else
         {
             ESP_LOGE(TAG, "Failed to initialize the card (%s). "
-                          "Make sure SD card lines have pull-up resistors in place.",
+                          "Make sure SD card lines have pull-up resistors in place. Restarting ESP32 to attempt remount.",
                      esp_err_to_name(ret));
+            esp_restart();
         }
         return;
     }
 
     ESP_LOGI(TAG, "Filesystem mounted");
-    // Now use POSIX and C standard library functions to work with files thanks to VFS FAT FS mounting.
+    
 
-    // Card has been initialized, print its properties
+    // At this point the card has been initialized, so print its properties
     sdmmc_card_print_info(stdout, card);
 
     int prev_dir_num = get_previous_written_dir_num();
@@ -243,7 +324,9 @@ void app_main(void)
     snprintf(new_dir_name, sizeof(new_dir_name), "%s/DIR%d", MOUNT_POINT, current_dir_num);
     if (mkdir(new_dir_name, 0775) != 0)
     {
-        ESP_LOGE(TAG, "Failed to create directory %s", new_dir_name);
+        ESP_LOGE(TAG, "Failed to create directory %s. Restarting ESP32 to re-attempt dir creation.", new_dir_name);
+        esp_restart();
+
     }
     else
     {
@@ -253,16 +336,44 @@ void app_main(void)
     sprintf(file_path, "%s/FILE_0.txt", new_dir_name);
     ESP_LOGI(TAG, "Writing to this path now: %s \n", file_path);
 
-    // Create a FreeRTOS queue for byte data to be shared between tasks on different cores
+    // Create a FreeRTOS queue for data chunks to be shared between tasks on different cores
     data_queue = xQueueCreate(QUEUE_LENGTH, QUEUE_ITEM_SIZE);
     if (data_queue == NULL)
     {
-        ESP_LOGE(TAG, "Failed to create queue");
-        return;
+        ESP_LOGE(TAG, "Failed to create queue. Restarting ESP32 to re-attempt queue creation.");
+        esp_restart();
     }
+    //----------------------- FPGA SPI CONFIG --------------------------
 
-    xTaskCreatePinnedToCore(sd_card_writer_task, "sd_card_writer_task", 77777, NULL, 7, NULL, 1); // Run on core 0
-    xTaskCreatePinnedToCore(data_generator_task, "data_generator_task", 77777, NULL, 5, NULL, 0); // Run on core 1
+    // Configuration for the FPGA SPI slave interface
+    spi_slave_interface_config_t slvcfg = {
+        .mode = 0,
+        .spics_io_num = PIN_FPGA_CS,
+        .queue_size = 3,
+        .flags = 0,
+        .post_setup_cb = NULL,
+        .post_trans_cb = NULL};
+
+    // Configuration for the FPGA SPI bus
+    spi_bus_config_t fpga_spi_buscfg = {
+        .mosi_io_num = PIN_FPGA_MOSI,
+        .miso_io_num = PIN_FPGA_MISO,
+        .sclk_io_num = PIN_FPGA_CLK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+    };
+
+    // Initialize SPI slave interface
+    ret = spi_slave_initialize(FPGA_SPI_HOST, &fpga_spi_buscfg, &slvcfg, SPI_DMA_CH_AUTO);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG,"Failed to initialize spi slave for FPGA data input. Restarting ESP32 to re-attempt spi slave init.");
+        esp_restart();
+    }
+    //---------------------------------------------------
+
+    xTaskCreatePinnedToCore(sd_card_writer_task, "sd_card_writer_task", 77777, NULL, 7, NULL, 1); // Run on core 1
+    // xTaskCreatePinnedToCore(data_generator_task, "data_generator_task", 77777, NULL, 5, NULL, 0); // Run on core 0
+    xTaskCreatePinnedToCore(read_spi_task, "read_spi_task", 77777, NULL, 5, NULL, 0); // Run on core 0 
 
     // Dont need to worry about freeing memory or unmounting cards as this program is
     // expected to run from power on until power off.
