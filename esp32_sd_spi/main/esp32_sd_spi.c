@@ -35,7 +35,9 @@ TODO - For each new file to write, check if there is space on the SD card for th
 #define FPGA_SPI_HOST VSPI_HOST
 
 #define MOUNT_POINT "/sdcard"
-#define DATA_CHUNK_SIZE 32768 // Size of a 'chunk' of data (bytes) for each write operation
+// #define DATA_CHUNK_SIZE 32768 // Size of a 'chunk' of data (bytes) for each write operation
+// #define DATA_CHUNK_SIZE 16 // debug so things fit on screen
+#define DATA_CHUNK_SIZE 512
 //#define BUFFER_SIZE 4092 // known to "work" in getting some data to sdcard
 #define BUFFER_SIZE 4 // saves memory, proper calculation for number of times
 
@@ -43,7 +45,8 @@ TODO - For each new file to write, check if there is space on the SD card for th
 #define QUEUE_ITEM_SIZE sizeof(data_chunk_t)
 #define MEASURE_INTERVAL_MS 5000 // Measure interval in milliseconds
 #define DATA_GEN_DELAY_US 1
-#define NUM_WRITES_PER_FILE_MAX 30
+//#define NUM_WRITES_PER_FILE_MAX 30
+#define NUM_WRITES_PER_FILE_MAX 1
 // Recall 4 GB is not 4^9 Bytes, rather 4 *1024 * 1024 * 1024 bytes
 #define SD_CARD_SIZE_BYTES 4194304 // Assume 4 GB MAX (given we are using Single Level Cell [SLC] type mem for flight hardyness)
 static QueueHandle_t data_queue;
@@ -108,7 +111,7 @@ static void read_spi_task(void *param)
         // Receive SPI packets until we have enough for a data_chunk_t
         while (packet_received_count < num_fpga_packets_per_chunk)
         {
-            memset(recvbuf, 0x00, recv_buf_size); //Clear receive buffer before each transaction
+            memset(recvbuf, 0x00, recv_buf_size); //Clear receive buffer before each transaction //remove
 
             t.length = (recv_buf_size) * 8; //length of a single transaction in bits
             t.tx_buffer = NULL;
@@ -122,7 +125,7 @@ static void read_spi_task(void *param)
             */
            /**/
             ret = spi_slave_transmit(FPGA_SPI_HOST, &t, portMAX_DELAY);
-            printf("%02X \n", *recvbuf);
+            //printf("%02X \n", *recvbuf); // for debug
             if (ret != ESP_OK)
             {
                 ESP_LOGI(TAG, "Spi slave recv error ");
@@ -149,21 +152,27 @@ static void read_spi_task(void *param)
             // spi_slave_transmit does not return until the master has done a transmission, so by here we have sent our data and
             // received data from the master.
 
-            chunk.data[packet_received_count] = *recvbuf; // does this write only the first byte or whole pointer block?
-            /*
-            chunk.data[packet_received_count * 4] = packet_received_count;
-            chunk.data[packet_received_count * 4 + 1] = packet_received_count;
-            chunk.data[packet_received_count * 4 + 2] = packet_received_count;
-            chunk.data[packet_received_count * 4 + 3] = packet_received_count; // got sd and watchdog errors
-            */
+            /**/
+            chunk.data[packet_received_count * 4 + 0] = *(recvbuf + 0);
+            chunk.data[packet_received_count * 4 + 1] = *(recvbuf + 1);
+            chunk.data[packet_received_count * 4 + 2] = *(recvbuf + 2);
+            chunk.data[packet_received_count * 4 + 3] = *(recvbuf + 3);
+            packet_received_count++;
+            /**/
 
-            packet_received_count++;
-            packet_received_count++;
-            packet_received_count++;
+
             //printf("%d\n", packet_received_count); // added with the 4 passes to chunk.data
         }
         //printf("Data chunk built! \n");
+        /*
+        for (int i = 0; i < 16; i++)
+        {
+            printf("%02X ", chunk.data[i]);
+        }
+        printf("\n");
+        */
 
+        /**/
         // Place data chunk onto the queue
         if (xQueueSend(data_queue, &chunk, portMAX_DELAY) != pdPASS)
         {
@@ -173,7 +182,9 @@ static void read_spi_task(void *param)
         {
             // ESP_LOGI(TAG, "Data chunk written to task: ");
         }
-        memset(chunk.data, 0, DATA_CHUNK_SIZE); // Clear the data chunk for the next iteration
+        /**/
+
+        memset(chunk.data, 0, DATA_CHUNK_SIZE); // Clear the data chunk for the next iteration // remove
     }
 }
 
@@ -383,7 +394,7 @@ void app_main(void)
     spi_slave_interface_config_t slvcfg = {
         .mode = 0,
         .spics_io_num = PIN_FPGA_CS,
-        .queue_size = 3,
+        .queue_size = 1,
         .flags = 0,
         .post_setup_cb = NULL,
         .post_trans_cb = NULL};
